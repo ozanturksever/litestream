@@ -126,16 +126,23 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.nc != nil {
+	// Check if fully initialized (both connection and object store)
+	if c.nc != nil && c.objectStore != nil {
 		return nil
 	}
 
-	if err := c.connect(ctx); err != nil {
-		return fmt.Errorf("nats: failed to connect: %w", err)
+	// Connect if not already connected
+	if c.nc == nil {
+		if err := c.connect(ctx); err != nil {
+			return fmt.Errorf("nats: failed to connect: %w", err)
+		}
 	}
 
-	if err := c.initObjectStore(ctx); err != nil {
-		return fmt.Errorf("nats: failed to initialize object store: %w", err)
+	// Initialize object store if not already done
+	if c.objectStore == nil {
+		if err := c.initObjectStore(ctx); err != nil {
+			return fmt.Errorf("nats: failed to initialize object store: %w", err)
+		}
 	}
 
 	return nil

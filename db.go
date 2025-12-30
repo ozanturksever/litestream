@@ -830,7 +830,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create temp L0 file: %w", err)
 	}
-	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
+	// Track whether rename succeeded so we don't try to remove a non-existent file.
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
 	if _, err := io.Copy(tmpFile, reader); err != nil {
 		_ = tmpFile.Close()
@@ -848,8 +854,14 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	// Atomically rename temp file to final path
 	if err := os.Rename(tmpPath, localPath); err != nil {
+		// If the temp file was removed (e.g., by removeTmpFiles during rapid failover),
+		// log and return error - the caller can retry.
+		if os.IsNotExist(err) {
+			db.Logger.Warn("temp L0 file removed before rename", "file", tmpPath)
+		}
 		return fmt.Errorf("rename L0 file: %w", err)
 	}
+	renamed = true
 
 	db.Logger.Info("fetched latest L0 file from replica",
 		"min_txid", minTXID,
@@ -1152,7 +1164,16 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	if err != nil {
 		return false, fmt.Errorf("open temp ltx file: %w", err)
 	}
-	defer func() { _ = os.Remove(tmpFilename) }()
+	// Track whether rename succeeded so we don't try to remove a non-existent file.
+	// This also handles the race condition where removeTmpFiles() may delete our
+	// temp file during rapid failover (when db.Open() is called while sync is
+	// still completing from a previous session).
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = os.Remove(tmpFilename)
+		}
+	}()
 	defer func() { _ = ltxFile.Close() }()
 
 	uid, gid := internal.Fileinfo(db.fileInfo)
@@ -1217,8 +1238,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
 		db.maxLTXFileInfos.Unlock()
+		// If the temp file was removed (e.g., by removeTmpFiles during rapid failover),
+		// treat this as a non-fatal error since the data will be re-synced on the next cycle.
+		if os.IsNotExist(err) {
+			db.Logger.Warn("temp file removed before rename, will retry on next sync", "file", tmpFilename)
+			return false, nil
+		}
 		return false, fmt.Errorf("rename ltx file: %w", err)
 	}
+	renamed = true
 
 	// Update file info cache for L0.
 	db.maxLTXFileInfos.Lock()
