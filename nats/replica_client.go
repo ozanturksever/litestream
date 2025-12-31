@@ -88,6 +88,7 @@ func NewReplicaClient() *ReplicaClient {
 		logger:               slog.Default().WithGroup(ReplicaClientType),
 		MaxReconnects:        -1, // Unlimited
 		ReconnectWait:        2 * time.Second,
+		ReconnectJitter:      500 * time.Millisecond,
 		Timeout:              10 * time.Second,
 		PingInterval:         2 * time.Minute,
 		MaxPingsOut:          2,
