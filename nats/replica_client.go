@@ -46,7 +46,7 @@ type ReplicaClient struct {
 	objectStore jetstream.ObjectStore
 
 	// Configuration
-	URL        string   // NATS server URL
+	URL        string   // NATS server URL (can be comma-separated for multiple servers)
 	BucketName string   // Object store bucket name
 	Path       string   // Base path for LTX files within the bucket
 	JWT        string   // JWT token for authentication
@@ -65,27 +65,36 @@ type ReplicaClient struct {
 	// managed externally via NATS CLI or API, not by Litestream
 
 	// Connection options
-	MaxReconnects    int                          // Maximum reconnection attempts (-1 for unlimited)
-	ReconnectWait    time.Duration                // Wait time between reconnection attempts
-	ReconnectJitter  time.Duration                // Random jitter for reconnection
-	Timeout          time.Duration                // Connection timeout
-	PingInterval     time.Duration                // Ping interval
-	MaxPingsOut      int                          // Maximum number of pings without response
-	ReconnectBufSize int                          // Reconnection buffer size
-	UserJWT          func() (string, error)       // JWT callback
-	SigCB            func([]byte) ([]byte, error) // Signature callback
+	MaxReconnects        int                          // Maximum reconnection attempts (-1 for unlimited)
+	ReconnectWait        time.Duration                // Wait time between reconnection attempts
+	ReconnectJitter      time.Duration                // Random jitter for reconnection
+	Timeout              time.Duration                // Connection timeout
+	PingInterval         time.Duration                // Ping interval
+	MaxPingsOut          int                          // Maximum number of pings without response
+	ReconnectBufSize     int                          // Reconnection buffer size
+	DrainTimeout         time.Duration                // Timeout for draining connection on close
+	RetryOnFailedConnect bool                         // Retry if initial connection fails
+	NoRandomize          bool                         // If true, servers are tried in order (disables randomization)
+	UserJWT              func() (string, error)       // JWT callback
+	SigCB                func([]byte) ([]byte, error) // Signature callback
+
+	// Logger for connection events (optional, uses slog.Default() if nil)
+	Logger *slog.Logger
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		logger:           slog.Default().WithGroup(ReplicaClientType),
-		MaxReconnects:    -1, // Unlimited
-		ReconnectWait:    2 * time.Second,
-		Timeout:          10 * time.Second,
-		PingInterval:     2 * time.Minute,
-		MaxPingsOut:      2,
-		ReconnectBufSize: 8 * 1024 * 1024, // 8MB
+		logger:               slog.Default().WithGroup(ReplicaClientType),
+		MaxReconnects:        -1, // Unlimited
+		ReconnectWait:        2 * time.Second,
+		Timeout:              10 * time.Second,
+		PingInterval:         2 * time.Minute,
+		MaxPingsOut:          2,
+		ReconnectBufSize:     8 * 1024 * 1024, // 8MB
+		DrainTimeout:         30 * time.Second,
+		RetryOnFailedConnect: true,  // Retry initial connection failures
+		NoRandomize:          false, // Randomize server order by default for load balancing
 	}
 }
 
@@ -121,6 +130,14 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// getLogger returns the configured logger or a default one.
+func (c *ReplicaClient) getLogger() *slog.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return c.logger
+}
+
 // Init initializes the connection to NATS JetStream. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) error {
 	c.mu.Lock()
@@ -150,6 +167,8 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 
 // connect establishes a connection to NATS server with proper configuration.
 func (c *ReplicaClient) connect(_ context.Context) error {
+	logger := c.getLogger()
+
 	opts := []nats.Option{
 		nats.MaxReconnects(c.MaxReconnects),
 		nats.ReconnectWait(c.ReconnectWait),
@@ -158,7 +177,51 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		nats.PingInterval(c.PingInterval),
 		nats.MaxPingsOutstanding(c.MaxPingsOut),
 		nats.ReconnectBufSize(c.ReconnectBufSize),
+		nats.DrainTimeout(c.DrainTimeout),
 	}
+
+	// Retry on failed connect - keeps trying if initial connection fails
+	if c.RetryOnFailedConnect {
+		opts = append(opts, nats.RetryOnFailedConnect(true))
+	}
+
+	// Server ordering - disable randomization if requested
+	if c.NoRandomize {
+		opts = append(opts, nats.DontRandomize())
+	}
+
+	// Disconnect handler - log when connection is lost
+	opts = append(opts, nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+		if err != nil {
+			logger.Warn("NATS disconnected", "error", err, "url", nc.ConnectedUrl())
+		} else {
+			logger.Info("NATS disconnected", "url", nc.ConnectedUrl())
+		}
+	}))
+
+	// Reconnect handler - log successful reconnections
+	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
+		logger.Info("NATS reconnected", "url", nc.ConnectedUrl(), "reconnects", nc.Reconnects)
+	}))
+
+	// Discovered servers handler - log when new servers are discovered via gossip
+	opts = append(opts, nats.DiscoveredServersHandler(func(nc *nats.Conn) {
+		logger.Info("NATS discovered new servers", "servers", nc.DiscoveredServers())
+	}))
+
+	// Error handler - log async errors
+	opts = append(opts, nats.ErrorHandler(func(nc *nats.Conn, sub *nats.Subscription, err error) {
+		if sub != nil {
+			logger.Error("NATS async error", "error", err, "subject", sub.Subject)
+		} else {
+			logger.Error("NATS async error", "error", err)
+		}
+	}))
+
+	// Closed handler - log when connection is fully closed
+	opts = append(opts, nats.ClosedHandler(func(nc *nats.Conn) {
+		logger.Info("NATS connection closed")
+	}))
 
 	// Authentication options
 	switch {
@@ -187,18 +250,19 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		opts = append(opts, nats.RootCAs(c.RootCAs...))
 	}
 
-	// Note: NATS Connect doesn't directly support context cancellation during connection
-	// The context parameter is preserved for potential future use
-
 	url := c.URL
 	if url == "" {
 		url = nats.DefaultURL
 	}
 
+	logger.Debug("connecting to NATS", "url", url, "retry_on_failed_connect", c.RetryOnFailedConnect)
+
 	nc, err := nats.Connect(url, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to connect to NATS server: %w", err)
 	}
+
+	logger.Info("connected to NATS", "url", nc.ConnectedUrl(), "cluster", nc.ConnectedClusterName())
 
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -437,7 +501,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for _, fileInfo := range a {
 		objectPath := c.ltxPath(fileInfo.Level, fileInfo.MinTXID, fileInfo.MaxTXID)
 
-		c.logger.Debug("deleting ltx file", "level", fileInfo.Level, "minTXID", fileInfo.MinTXID, "maxTXID", fileInfo.MaxTXID, "path", objectPath)
+		c.getLogger().Debug("deleting ltx file", "level", fileInfo.Level, "minTXID", fileInfo.MinTXID, "maxTXID", fileInfo.MaxTXID, "path", objectPath)
 
 		if err := c.objectStore.Delete(ctx, objectPath); err != nil {
 			if !isNotFoundError(err) {
